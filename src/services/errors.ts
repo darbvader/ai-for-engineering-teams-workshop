@@ -45,3 +45,45 @@ export function isMarketIntelligenceError(
 ): candidate is MarketIntelligenceError {
   return candidate instanceof MarketIntelligenceError;
 }
+
+/**
+ * Failure codes the Predictive Intelligence service can raise.
+ *
+ * `RATE_LIMITED` is raised by the route's limiter rather than by the service
+ * itself, but lives here so one error type covers the whole feature and the
+ * route needs only one `catch`.
+ */
+export type PredictiveIntelligenceErrorCode = 'INVALID_INPUT' | 'RATE_LIMITED' | 'INTERNAL';
+
+/**
+ * Error thrown by `PredictiveIntelligenceService` and its request validators.
+ *
+ * The `message` is user-safe by contract — the routes echo it into the response
+ * body, so it must never carry a stack trace, an internal path, upstream detail,
+ * or any customer data.
+ */
+export class PredictiveIntelligenceError extends Error {
+  readonly code: PredictiveIntelligenceErrorCode;
+
+  /**
+   * @param code - Failure category, used by the route to pick a status.
+   * @param message - User-safe explanation.
+   */
+  constructor(code: PredictiveIntelligenceErrorCode, message: string) {
+    super(message);
+    this.name = 'PredictiveIntelligenceError';
+    this.code = code;
+    Object.setPrototypeOf(this, PredictiveIntelligenceError.prototype);
+  }
+}
+
+/**
+ * Narrows an unknown thrown value to a `PredictiveIntelligenceError`.
+ *
+ * @param candidate - Value caught in a `catch` block.
+ */
+export function isPredictiveIntelligenceError(
+  candidate: unknown
+): candidate is PredictiveIntelligenceError {
+  return candidate instanceof PredictiveIntelligenceError;
+}

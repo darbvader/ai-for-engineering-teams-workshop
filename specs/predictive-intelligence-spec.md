@@ -31,7 +31,7 @@ Every "match the existing pattern" instruction below is therefore conditional. F
 
 | Dependency | If it exists when you implement | If it does not exist |
 |---|---|---|
-| `calculateHealthScore` (`src/lib/healthCalculator.ts`, per `@requirements/health-score-calculator.md`) | Call it to derive the current score and per-factor breakdown; surface the breakdown in the alert detail panel | Use the static `customer.healthScore` field and omit the factor breakdown from the detail panel |
+| `calculateHealthScore` (`src/lib/healthCalculator.ts`, per `@specs/health-score-calculator-spec.md`) | Call it for the per-factor breakdown shown in the detail panel, subject to **Health Score Integration** below | Omit the factor breakdown from the detail panel; every rule still uses `customer.healthScore` |
 | `MarketIntelligenceService` (`@specs/market-intelligence-spec.md`) | Call `getMarketIntelligence(company)` and reuse its cache | Call `generateMockMarketData` / `calculateMockSentiment` directly, and see **Market Signal Preconditions** below |
 | `CustomerSelector` / `Dashboard` | Receive `selectedCustomer` via props from the Dashboard's existing selection state | Render standalone against `mockCustomers` with an internal selector stub |
 | Sibling widget card shell, loading and error states | Copy padding, border, radius, heading treatment, skeleton and error banner verbatim | Use the fallback card shell below |
@@ -40,6 +40,16 @@ Every "match the existing pattern" instruction below is therefore conditional. F
 **Fallback card shell:** `rounded-lg border border-gray-200 bg-white p-4 shadow-sm`, heading `text-lg font-semibold text-gray-900 mb-3`, body `text-sm text-gray-600`. Priority colour language mirrors the health-score banding used elsewhere in the dashboard (red 0–30 / yellow 31–70 / green 71–100): red = high priority, yellow = medium priority, green = no alerts.
 
 Do not claim conformance to a pattern you did not actually open and read.
+
+### Health Score Integration
+
+`@specs/health-score-calculator-spec.md` now exists and is concrete, which creates three seams this spec must pin rather than leave to the implementer.
+
+**1. `customer.healthScore` is the single source of truth for every rule.** Three rules gate on a health value (`PAYMENT_RISK`'s drop clause, `CONTRACT_EXPIRATION_RISK`, `MARKET_SENTIMENT_RISK`), and `healthHistory`'s newest entry is required to equal `customer.healthScore`. If rules instead consumed a freshly computed `calculateHealthScore` result, that computed value could differ from the score the rest of the dashboard displays — reproducing exactly the "widget shows one number while the alert reasons about another" bug this spec forbids in its own Data Requirements. So `calculateHealthScore` is used **only** to populate the detail panel's factor breakdown, never to drive a trigger. When the computed total and `customer.healthScore` disagree, the panel shows both and labels the computed one "recalculated", rather than silently preferring either.
+
+**2. The adapter belongs to this feature, not to the calculator.** That module is pure and explicitly refuses to read the clock: "all *days since / days until* values are supplied by the caller, already computed." `PredictiveIntelligenceService` therefore owns a `toHealthScoreInput(signals, now)` adapter that derives `daysSinceLastPayment`, `daysUntilRenewal`, and every other delta from the injected `now`. Do not add clock access to `healthCalculator.ts`.
+
+**3. Units differ and must be converted at the boundary.** `CustomerSignals` stores money in **cents** (`overdueAmountCents`, `arrCents`); `HealthScoreInput` takes `overdueAmount` and `contractValue` in **currency units**. The adapter divides by 100. Passing cents straight through would inflate overdue severity by 100× and silently zero out the payment factor — a defect that produces plausible-looking scores, so a unit-conversion test is required rather than optional.
 
 ### Market Signal Preconditions
 
@@ -342,6 +352,7 @@ export function reset(): void;   // tests only
 #### Service Layer — `src/services/PredictiveIntelligenceService.ts`
 
 - `getIntelligence(request: IntelligenceRequest): Promise<PredictiveIntelligenceResult>` where the request carries `customerIds`, optional `priority` filter, optional `timezone`, and optional `thresholds` override.
+- Owns `toHealthScoreInput(signals, now)` — the unit-converting, delta-computing adapter described in **Health Score Integration**.
 - Orchestration order: validate input → load customers → resolve **cached inputs** (signals + health + market) per customer → `alertEngine` with `priorState` from the store → `reconcile` the store → apply cooldown/business-hours to compute `notificationSuppressedUntil` → filter dismissed → rank.
 - Constructor takes `{ now?: () => number; ttlMs?: number; delayMs?: () => number; marketService?: MarketIntelligenceService }`, defaulting to `Date.now`, `60_000`, and a 200–600ms simulated delay. Without the injected clock, the TTL, the cooldown windows, the dismissal TTL, and the business-hours logic are all untestable except by waiting.
 - **The cache holds inputs, not results.** `Map<string, { signals, health, market, expiresAt }>` keyed by customer id, 60-second TTL, bounded at 200 entries with **true LRU** — on each hit `delete` then re-`set` the entry to move it to the tail, because a plain `Map` preserves insertion order, not access order, and skipping that step silently degrades to FIFO. Expired entries are evicted on access, never served stale. `clearCache()` exposed for tests. Revision 1 cached scored alerts per customer and then asserted that two requests inside the TTL return an identical `evaluatedAt` — unsatisfiable, since `evaluatedAt` is a property of the assembled response and per-customer entries expire independently. `evaluatedAt` is now always the current time, and identity across requests is asserted on the cached *inputs* instead.
@@ -490,7 +501,7 @@ The repository has no test runner, so every threshold, cooldown, and cache crite
 - `src/lib/businessHours.test.ts` — inside and outside the window, weekend, a DST transition day, and an explicitly passed non-server timezone
 - `src/server/alertStateStore.test.ts` — dedup key stability, `occurrenceCount` increments without duplicating rows, dismissal round-trip, dismissal-TTL expiry restoring `active` with the count preserved, cooldown suppression logged, ring-buffer cap, fatigue-metric arithmetic
 - `src/server/rateLimit.test.ts` — window boundary, per-key isolation, `Retry-After` value
-- `src/services/PredictiveIntelligenceService.test.ts` — input-cache hit/miss, TTL expiry via the injected clock, LRU eviction at the 200-entry cap, scores recomputed (not cached) as the clock advances, market-fetch failure degrading to `market: null` with internal alerts intact, thrown error types
+- `src/services/PredictiveIntelligenceService.test.ts` — `toHealthScoreInput` cents-to-currency conversion and clock-derived deltas, input-cache hit/miss, TTL expiry via the injected clock, LRU eviction at the 200-entry cap, scores recomputed (not cached) as the clock advances, market-fetch failure degrading to `market: null` with internal alerts intact, thrown error types
 - `src/data/mock-customer-signals.test.ts` — determinism per id, newest health snapshot equals `customer.healthScore`, and every row of the pinned fixture table producing exactly its intended outcome
 - `src/lib/alerts.caps.test.ts` — the global cap against a synthetic 200-customer set, since eight fixtures cannot reach it
 
@@ -574,6 +585,12 @@ Each of these appears in the source requirements and is excluded with a reason, 
 - [ ] Inserting 201 distinct customers evicts the least-recently-*accessed* entry, not the oldest-inserted — verified by reading an early entry before overflowing the cache
 - [ ] A market fetch that rejects for one customer leaves every other customer's market data intact and internal alerts unaffected
 - [ ] The service throws `PredictiveIntelligenceError`, not a bare `Error`, and the route maps `INVALID_INPUT` to 400 and `RATE_LIMITED` to 429
+
+### Health Score Integration
+- [ ] No rule reads a computed `calculateHealthScore` total; all three health-gated rules read `customer.healthScore`
+- [ ] `toHealthScoreInput` converts `overdueAmountCents` and `arrCents` to currency units — asserted with a fixture whose cents value would otherwise inflate overdue severity 100×
+- [ ] Every day-delta passed to `calculateHealthScore` is derived from the service's injected `now`; `healthCalculator.ts` gains no clock access
+- [ ] When the recalculated total differs from `customer.healthScore`, the detail panel shows both and labels the computed one "recalculated"
 
 ### Mock Data
 - [ ] The same customer id yields identical signals across repeated calls and process restarts; no `Math.random()` remains in the module

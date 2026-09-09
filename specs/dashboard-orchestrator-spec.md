@@ -29,6 +29,16 @@ implement or verify. Instead:
   [Deferred With Rationale](#deferred-with-rationale) with what would need to exist first
 - Nothing from the requirements is dropped without appearing in one of those two places
 
+That last claim is only worth making if it has been checked, so it has been: an adversarial pass
+walked `requirements/production-ready-dashboard.md` line by line against this document and found ten
+requirements in neither place. All ten are now covered — three-level error boundaries (F5b),
+fallbacks that preserve functionality (F5c), API-response validation and client-side export
+throttling (S4), form error associations (A11Y-2), environment config and log levels (S6), Core Web
+Vitals collection and bundle budgets (P1), and network-failure plus mobile-screen-reader testing
+(Testing) — or deferred explicitly, in the case of historical/trend data, chart alt text, and secure
+cookies. Re-run that audit before claiming the spec is complete; a coverage promise decays every
+time either document is edited.
+
 ## Prerequisites and Dependency Graph
 
 **This spec forward-references components that do not exist yet.** At the time of writing, `src/`
@@ -62,7 +72,7 @@ is the only mechanism in this spec that is load-bearing for the whole design.
 
 Do not claim conformance to a sibling pattern you did not actually open and read.
 
-### Two conflicts with existing specs that must be resolved, not ignored
+### Three conflicts with existing specs that must be resolved, not ignored
 
 #### `page.tsx` expects a default export; `CustomerCard` forbids one
 
@@ -90,6 +100,20 @@ the file to the re-export; do not leave two boundaries with diverging retry sema
 Widgets do **not** wrap themselves. The orchestrator wraps every registry entry exactly once, so a
 widget author cannot forget and cannot double-wrap.
 
+#### The Market Intelligence widget's own live region must be removed
+
+`specs/market-intelligence-spec.md` requires "the results region is `aria-live="polite"`" and lists
+it as an acceptance criterion. A11Y-1 below shows why that cannot survive contact with three sibling
+widgets doing the same thing: a single customer selection produces four overlapping announcements.
+
+**Resolution:** the orchestrator's rule wins, and this is a genuine breaking change to a written
+spec rather than a reinterpretation. `MarketIntelligenceWidget` keeps `aria-busy` on its results
+container and routes its announcements through `announce()` from context. Its acceptance criterion
+"the results region announces updates to screen readers" still holds — the announcement now comes
+from the shared region — but the literal `aria-live="polite"` attribute is gone, and that spec
+should be amended rather than left contradicting this one. Unlike the two conflicts above, this one
+cannot be resolved by a compatibility shim; someone has to edit the other document.
+
 ## Integration Architecture
 
 ### Component interaction diagram
@@ -106,10 +130,14 @@ src/app/layout.tsx  (Server Component — <html lang="en">, fonts, metadata)
             │         ├─ <main id="main-content">
             │         │    └─ <DashboardGrid>            reads widgetRegistry, sorts by `order`
             │         │         └─ for each descriptor:
-            │         │              <section aria-labelledby={id}>       landmark + <h2>
-            │         │                └─ <WidgetErrorBoundary key={resetKey}>
+            │         │              <section aria-labelledby="widget-{id}-heading">
+            │         │                ├─ <h2 id="widget-{id}-heading">   OUTSIDE the boundary,
+            │         │                │                                  so it survives a failure
+            │         │                └─ <WidgetErrorBoundary key={id + ':' + customerId}>
             │         │                     └─ <Suspense fallback={<WidgetSkeleton/>}>
-            │         │                          └─ lazy(descriptor.load)   ← widget renders here
+            │         │                          └─ cached lazy(descriptor.load)  ← widget here
+            │         │                             (created once per id+attempt,
+            │         │                              never inside render)
             │         └─ <ExportDialog>      native <dialog>, focus trap for free, mounted last
             │
             └─ services reached from anywhere via context or direct import:
@@ -180,10 +208,12 @@ export interface WidgetDescriptor {
   /** Tailwind column span classes per breakpoint. */
   gridSpan: string;
   /**
-   * Lazy loader. Must resolve to `{ default: ComponentType<WidgetProps> }`.
+   * Lazy loader. Must resolve to `{ default: ComponentType<WidgetProps> }`,
+   * and must NEVER reject — see "Loader failure" below.
    * Widgets use named exports, so the loader adapts:
    *   () => import('@/components/MarketIntelligenceWidget')
    *            .then(m => ({ default: m.MarketIntelligenceWidget }))
+   *            .catch(() => ({ default: WidgetUnavailableTile }))
    */
   load: () => Promise<{ default: React.ComponentType<WidgetProps> }>;
   /**
@@ -206,13 +236,39 @@ export interface WidgetProps {
   outer margins, borders, or card chrome. The orchestrator owns the card shell so the grid stays
   visually uniform, which is precisely what `specs/market-intelligence-spec.md` anticipated with its
   "fallback card shell"
-- **A registry entry whose `load` rejects is expected, not exceptional.** Most widgets do not exist
-  yet. `DashboardGrid` catches the rejection and renders `WidgetUnavailableTile` — a bordered tile
-  reading e.g. "Market Intelligence — not yet implemented" — and does **not** call `reportError` for
-  a module-not-found rejection. Reporting those would flood `/api/errors` with expected noise
-  during the workshop. Any other rejection reason is reported normally
+- `requiresCustomer` drives two behaviors, both in `DashboardGrid`: when it is `true` and
+  `selectedCustomer` is `null`, the tile renders a "Select a customer to see this widget" prompt
+  instead of mounting the widget (no wasted chunk fetch, no widget having to invent an empty state
+  the orchestrator can render once); and such a widget is skipped when collecting export providers,
+  because it has no data to offer
 - Adding a widget must require touching exactly one file: this registry. If implementing a new
   widget requires editing `DashboardOrchestrator.tsx`, the abstraction has failed
+
+##### Loader failure and the three `React.lazy` traps
+
+Most widgets do not exist yet, so **a `load` that cannot resolve its module is the expected case,
+not an exceptional one.** Three properties of `React.lazy` make the obvious implementation wrong,
+and all three must be handled explicitly:
+
+1. **A rejected lazy promise throws during render, so only an error boundary can catch it.** A
+   function component that renders the lazy element — `DashboardGrid` — cannot wrap it in
+   `try/catch`. Therefore **the loader catches its own rejection** and resolves to
+   `WidgetUnavailableTile`: a bordered tile reading e.g. "Market Intelligence — not yet
+   implemented". The registry is the only place that knows a missing module is expected, so it is
+   the only place that can distinguish it from a genuine failure. `load` never rejects; the
+   `WidgetErrorBoundary` above it therefore never sees module-not-found noise, and
+   `reportError` is not called for it. A `.catch` that receives any *other* reason — a chunk that
+   exists but throws while evaluating — resolves to the tile **and** reports normally.
+2. **`React.lazy` caches its rejection permanently.** The status lives on the lazy component object
+   itself, so once it has rejected it re-throws forever, and remounting with a new `key` does not
+   re-run the import. If the boundary's "Try again" (F5) is to mean anything for a widget whose
+   chunk failed on a flaky connection, the retry must **construct a fresh `lazy()`**. `DashboardGrid`
+   therefore keys its lazy components by `descriptor.id` *and* the boundary's attempt counter.
+3. **`lazy()` must not be called during render.** Calling it inline produces a new component *type*
+   every render, which unmounts and remounts every widget — discarding all widget state on any
+   parent re-render, including every customer selection. This would silently cancel P1's entire
+   memoization section. Lazy components are created once per `(descriptor, attempt)` pair and held
+   in a module-level or `useRef` cache, never constructed in the render body.
 
 #### F2 — Dashboard context: `src/lib/dashboard/DashboardContext.tsx`
 
@@ -305,8 +361,14 @@ export class ExportError extends AppError {}
   will throw inside the boundary and blank the page
 - Fallback content: a heading, a plain-language apology, a "Reload dashboard" button
   (`window.location.reload()`), and the error's `userMessage` when it is an `AppError`
-- The fallback container receives `role="alert"` and takes focus on mount, so a keyboard or screen
-  reader user is not left with focus on a node that no longer exists
+- The fallback container receives `role="alert"`. This is an **implicit assertive live region**, and
+  it is the one deliberate exception to the single-live-region rule in A11Y-1 — justified because by
+  the time it renders, the `Announcer` it would otherwise route through has been unmounted along with
+  the rest of the dashboard
+- Focus moves to the fallback's **"Reload dashboard" button**, not to the `role="alert"` container
+  itself. Moving focus onto a live region makes several screen-reader and browser pairs announce the
+  same text twice — once as the alert, once as the focused node. Landing on the actionable control
+  announces the alert once and puts the user on the only thing they can do
 - Reports with `severity: 'fatal'`, `category: 'render'`
 
 #### F5 — `WidgetErrorBoundary`: `src/components/WidgetErrorBoundary.tsx`
@@ -324,8 +386,11 @@ export interface WidgetErrorBoundaryProps {
 - Isolates one widget. A throw inside it must leave every sibling widget mounted, interactive, and
   with its state intact — this is the whole point of "graceful degradation when individual widgets
   or services fail"
-- Fallback: the standard card shell, the widget's title as its `h2` (so the page heading structure
-  does not develop a hole), a short message, and a "Try again" button
+- Fallback: a short message and a "Try again" button — **body content only, no heading.** The
+  `<section>` and its `<h2>` are rendered by `DashboardGrid` *outside* the boundary, so they survive
+  the failure and the page heading structure never develops a hole. A fallback that renders the
+  title again produces two `<h2>`s with identical text. `widgetTitle` is still a prop, used for the
+  message text and the error report, not for a heading
 - **Retry is bounded and the bound is the interesting part.** "Try again" increments an internal
   attempt counter and clears the error state. A component that throws deterministically — a bad
   `mockCustomers` field, say — will throw again immediately; without a cap, an auto-retry becomes an
@@ -338,18 +403,63 @@ export interface WidgetErrorBoundaryProps {
 - The attempt counter resets to zero when `selectedCustomerId` changes: a widget that crashed on one
   customer's data deserves a clean slate on the next. `DashboardGrid` supplies a `key` composed of
   the descriptor id and the selected customer id (or `'none'`) for exactly this reason
-- Focus moves to the fallback's heading on first error, and back to the retried widget's container
-  after a successful retry. Silently dropping focus to `<body>` is a WCAG 2.4.3 failure and is the
-  most common accessibility defect in error-boundary implementations
-- The boundary cannot use `useDashboard` (it is a class), so it does not announce through context
-  and instead relies on its `role="alert"` fallback container, which screen readers announce without
-  a live region
+- Focus moves to the fallback's "Try again" button when the error occurred while focus was **inside**
+  the failing widget, and stays put otherwise. Silently dropping focus to `<body>` is a WCAG 2.4.3
+  failure and is the most common accessibility defect in error-boundary implementations; equally,
+  stealing focus from a user who was working in a *different* widget is its own violation. Compare
+  the boundary's own subtree against `document.activeElement` before the error to decide
+- **The widget fallback carries no `role="alert"`.** It announces through the orchestrator's single
+  assertive region instead, keeping the A11Y-1 invariant intact. Being a class component does not
+  prevent this: `static contextType = DashboardContext` gives a class access to the same value
+  `useDashboard` returns — it is only the *hook* that is unavailable. (F4's boundary genuinely cannot
+  do this, because it wraps the provider itself.)
 - Reports with `severity: 'error'`, `category: 'render'`, and `detail.widgetId`
+
+#### F5b — The third level: component-level containment
+
+`requirements/production-ready-dashboard.md` names **three** levels — "dashboard, widget, component"
+— and the two boundaries above are only the first two. The third is not a third boundary component;
+wrapping every leaf in a boundary would bloat the tree and produce fallbacks too small to say
+anything useful. It is a rule about *where a widget author puts a boundary inside their own widget*:
+
+- A widget that renders a **list of independently-sourced items** wraps each item, so one malformed
+  record does not blank the list. Concretely: `CustomerSelector` wraps each `CustomerCard`, so a
+  customer whose `healthScore` is a value the card's normalization somehow rejects costs one card,
+  not the whole selector
+- A widget with a **visually separable subsection** (a chart beside a table) wraps each subsection
+- Component-level fallbacks are **inline and minimal**: a single line of text sized to the slot it
+  replaces, no heading, no retry button. Retry belongs at the widget level, where there is room to
+  explain it
+- Component-level boundaries reuse `WidgetErrorBoundary` with `maxRetries: 0` and report with
+  `severity: 'warning'`, so a swarm of item-level failures is distinguishable in the logs from one
+  widget collapsing
+- This level is **the widget author's responsibility**, not the orchestrator's. The orchestrator
+  cannot see inside a lazily-loaded widget. It is specified here because "consistent error handling
+  patterns across all widgets" is an integration requirement, and consistency needs a written rule
+
+#### F5c — Fallbacks that preserve core functionality
+
+The requirements ask for "Fallback UI components that maintain core dashboard functionality", which
+an inert "something went wrong" card does not do. What must keep working when a widget fails:
+
+- **Customer selection survives every widget failure.** `CustomerSelector` is the dashboard's
+  primary control; if any *other* widget fails, selection is untouched. If `CustomerSelector` itself
+  fails, its fallback still offers a minimal `<select>` of customer names built from `mockCustomers`
+  — no search, no cards, no health scores, but the dashboard remains navigable rather than becoming
+  read-only
+- **Export survives widget failure.** A failed widget withdraws its export provider (its `useEffect`
+  cleanup runs on unmount), so the export dialog offers fewer datasets rather than erroring. Export
+  of the datasets that *are* available must still work with any subset of widgets broken
+- **A failed widget never blocks a keyboard shortcut, the skip link, or the announcer**, all of
+  which live above the widget boundaries
+- These are the properties the "graceful degradation" acceptance criteria test — not merely that a
+  fallback rendered
 
 #### F6 — Development vs production error display
 
-- Read `process.env.NODE_ENV` once, in one module, exported as `const isDevelopment`. Scattering
-  `NODE_ENV` checks through components makes the production path impossible to reason about
+- Read `process.env.NODE_ENV` once, in `src/lib/config.ts` (S6), exported as `const isDevelopment`.
+  Scattering `NODE_ENV` checks through components makes the production path impossible to reason
+  about
 - **Development:** fallbacks additionally render `error.message`, `error.stack`, and the React
   `componentStack` inside a collapsed `<details>` element. Do not rethrow in `componentDidCatch` —
   Next's dev overlay already surfaces errors in development, and rethrowing would escalate a
@@ -370,12 +480,23 @@ export function reportError(error: unknown, context: ErrorContext): void;
   itself throw will take down the boundary that called it
 - Transport: `navigator.sendBeacon` when available (survives page unload), else `fetch` with
   `keepalive: true`. Both are wrapped in `try/catch` that does nothing on failure
+- **`sendBeacon` must be passed a typed `Blob`, not a string.** Given a string it sends
+  `Content-Type: text/plain`, and a route that validates for `application/json` will reject every
+  report — a failure that is invisible precisely because the transport is fire-and-forget. Send
+  `new Blob([json], { type: 'application/json' })`, and have the route accept both content types so
+  a browser without `Blob`-typed beacon support still gets through
 - **Redaction is mandatory and happens client-side, before transmission.** `mockCustomers` contains
   names, companies, and email addresses; an error payload that interpolates a customer object ships
-  PII to a log. Allowed: `customerId`, `widgetId`, `category`, `severity`, error `name`, `message`,
-  `stack`, `componentStack`, `pathname`, a `sessionId`, and `detail` values. Forbidden, and stripped
-  by an explicit allowlist rather than a denylist: `name`, `company`, `email`, `domains`, and any
-  string matching an email-shaped pattern anywhere in the payload
+  PII to a log. The allowlist is expressed over exact paths, because the bare key `name` is
+  ambiguous — `error.name` is wanted, `customer.name` is not:
+  - **Allowed:** `error.name`, `error.message`, `error.stack`, `componentStack`, `customerId`,
+    `widgetId`, `category`, `severity`, `pathname`, `sessionId`, and `detail` values
+  - **Stripped:** every customer field — `customer.name`, `company`, `email`, `domains` — plus any
+    string matching an email-shaped pattern anywhere in the payload, including inside `detail` and
+    inside `error.message`
+  - Implemented as an explicit allowlist that copies permitted paths into a fresh object, never as a
+    denylist that deletes keys from the original. A denylist silently ships every field someone adds
+    later
 - **Bounded, or a render loop becomes a denial of service against your own logs.** Client-side:
   at most 10 reports per session, at most 1 identical report (same `name` + first stack frame +
   `widgetId`) per 60 seconds, payload truncated to 8 KB with `stack` trimmed first
@@ -386,8 +507,13 @@ export function reportError(error: unknown, context: ErrorContext): void;
 Route: `src/app/api/errors/route.ts`
 
 - `POST` only. Any other method returns `405`
-- Validates the body against an explicit schema and rejects unknown top-level keys. `Content-Length`
-  over 16 KB returns `413` without reading the body
+- Accepts `application/json` and `text/plain` (see the `sendBeacon` note above); any other content
+  type returns `415`
+- Validates the body against an explicit schema and rejects unknown top-level keys
+- **Body size is capped twice, because the cheap check is bypassable.** A `Content-Length` over
+  16 KB returns `413` before the body is read, but that header is absent on chunked requests and is
+  client-controlled, so the reader **also** counts bytes as it consumes the stream and aborts at
+  16 KB. A cap that trusts only `Content-Length` is not a cap
 - Rate limited per client — see S3
 - Always responds `204 No Content` on acceptance, with an empty body. There is nothing useful to
   return, and a response body here is an information-disclosure surface for no benefit
@@ -404,8 +530,15 @@ Route: `src/app/api/errors/route.ts`
 knows nothing about market sentiment, health scores, or alerts:
 
 ```ts
+export type ExportProviderId =
+  | 'customers'
+  | 'health-scores'
+  | 'alerts'
+  | 'market-intelligence';
+
 export interface ExportProvider {
-  id: string;                    // 'customers' | 'health-scores' | 'alerts' | 'market-intelligence'
+  /** Closed union, not `string` — the filename rule and the registry key both depend on it. */
+  id: ExportProviderId;
   label: string;                 // shown in the export dialog
   /** Column order for tabular formats. Also the payload allowlist. */
   columns: readonly string[];
@@ -449,6 +582,11 @@ non-obvious threat is on the *output* side:
   spreadsheet. Every such cell is prefixed with a single apostrophe (`'`) before quoting. React's
   JSX escaping — the entire basis of the card spec's security section — provides **no** protection
   here, because this text never passes through JSX
+- **The guard applies to string values only, decided by `typeof`, never by inspecting the rendered
+  text.** A health score of `-12` or a delta of `+4` is a `number`, and prefixing it would emit
+  `'-12`, which every spreadsheet imports as text — silently breaking sorting, charting, and
+  averaging on the numeric columns this dashboard exists to report. Numbers and booleans are
+  serialized directly; only `string` cells are ever prefixed
 - **Quoting.** A field containing `"`, `,`, `\n`, or `\r` is wrapped in double quotes with internal
   quotes doubled, per RFC 4180. Line terminator is `\r\n`
 - **Encoding.** A UTF-8 byte-order mark is prepended, or Excel on Windows mojibakes non-ASCII
@@ -463,23 +601,47 @@ non-obvious threat is on the *output* side:
   applied `ExportOptions`, `rowCount`, and `"dataSource": "mock"` — the same anti-deception rule the
   Market Intelligence spec enforces with its "Sample data" badge. An exported file outlives the UI
   that produced it, so the file itself must say the data is not real
-- Rows are streamed into the output incrementally with manual comma separation, not accumulated and
-  `JSON.stringify`-ed once, so memory stays flat and cancellation stays responsive
+- **`provider.columns` is enforced here exactly as it is in CSV.** Each row is projected onto the
+  declared columns before serialization. Without this the two formats disagree on what is
+  exportable: a provider that happens to yield `email` produces a clean CSV and a JSON file that
+  leaks it, defeating the redaction discipline F7 applies to error payloads. Column *order* is
+  irrelevant in JSON; the *allowlist* is not
+- Rows are written into the output incrementally with manual comma separation, not accumulated and
+  `JSON.stringify`-ed once, so the row objects are released as they are consumed
 
 **Chunking, progress, and cancellation** (`ExportUtils.ts`):
 
 - Rows are consumed in batches of 500. Between batches: check `signal.aborted` and bail; then yield
-  to the event loop (`scheduler.yield()` where available, else a `setTimeout(resolve, 0)` promise)
-  so the main thread stays responsive and the progress bar actually paints. Without a yield, a
-  synchronous loop over 10,000 rows freezes the tab and violates the 60fps requirement outright
+  to the event loop (`scheduler.yield()` where available, else a `MessageChannel` task — preferred
+  over `setTimeout(0)`, which browsers clamp to ~4ms once nesting passes depth 5, adding ~4ms of
+  dead time per batch) so the main thread stays responsive and the progress bar actually paints.
+  Without a yield, a synchronous loop over 10,000 rows freezes the tab outright
 - Progress is **determinate** only when `estimateCount` returns a number; otherwise the UI shows an
   indeterminate indicator and a running row count. A progress bar that fabricates a percentage from
   an unknown total is worse than none
 - On abort: no file is written, no partial download appears, and the dialog returns to its idle
   state with "Export cancelled" announced politely
-- Delivery is a client-side `Blob` + `URL.createObjectURL` + a synthetic anchor click, and
-  `URL.revokeObjectURL` in a `finally`. A leaked object URL pins the entire generated file in memory
-  for the life of the document — the exact "memory leak prevention" the requirements ask for
+
+**Delivery: two paths, because "streaming" and "download a Blob" are not the same thing.**
+`requirements/production-ready-dashboard.md` asks for "Streaming export capabilities for large
+datasets". Chunked *generation* alone does not deliver that — assembling chunks into one `Blob`
+still materializes the whole file in memory before the download starts, so peak memory is
+proportional to the export size no matter how small the batches are. Both paths below are required,
+and the spec must not claim streaming for the fallback:
+
+1. **True streaming, where the platform allows it.** When `window.showSaveFilePicker` is available,
+   acquire a `FileSystemWritableFileStream` up front and write each encoded batch straight to disk.
+   Memory stays flat regardless of row count, and an abort closes the stream and removes the
+   partial file. This is the path that actually satisfies the requirement.
+2. **Buffered fallback, explicitly bounded.** Otherwise accumulate encoded chunks and deliver via
+   `Blob` + `URL.createObjectURL` + a synthetic anchor click, with `URL.revokeObjectURL` in a
+   `finally` — a leaked object URL pins the entire file in memory for the life of the document.
+   Because this path is memory-bound, it is **capped at 50,000 rows**; beyond that the dialog
+   refuses the export and explains that the browser cannot stream it, rather than crashing the tab.
+   The cap is a named constant.
+
+The dialog tells the user which path they are on only when it matters — i.e. when the fallback's cap
+is what blocks an export.
 
 **Filenames** (`filename.ts`):
 
@@ -523,17 +685,28 @@ hears an unintelligible run-on. Per-widget live regions do not compose.
 - The orchestrator renders exactly **one** `aria-live="polite"` region and one
   `aria-live="assertive"` region, both visually hidden, both present in the DOM from first paint —
   a live region inserted at the same time as its content is frequently not announced at all
+- **The count includes implicit regions.** `role="alert"` and `role="status"` *are* live regions
+  (assertive and polite respectively), so scattering them is the same mistake as scattering
+  `aria-live`. The single documented exception is `DashboardErrorBoundary`'s `role="alert"` fallback
+  (F4), which only exists once the `Announcer` has been unmounted with the rest of the dashboard, so
+  the two can never be live at the same time. `WidgetErrorBoundary` therefore carries no
+  `role="alert"` and announces through the shared region instead
 - Widgets announce through `announce()` from context rather than owning a region. When a widget's
   own spec calls for `aria-live` on a results container (as Market Intelligence does), that
-  container keeps `aria-busy` and `role="status"` for state, and routes textual announcements
-  through `announce()`
+  container keeps **`aria-busy` only** — a non-live attribute that marks the region as updating —
+  and routes all textual announcements through `announce()`. It must not fall back to
+  `role="status"`, which is itself an implicit polite live region and would reintroduce exactly the
+  per-widget duplication this section exists to prevent
 - `announce` **serializes**: messages queue and are written to the region one at a time with a
   ~150ms gap, and an identical consecutive message is dropped. Writing a second message into a live
   region before the first is spoken cancels the first in several screen readers
 - `assertive` is reserved for errors and completed/failed exports. Everything else is `polite`
 - Required announcements: customer selected ("Selected {name}, {company}"), widget load failure,
-  export started, export progress at 25/50/75%, export complete with row count, export cancelled,
-  export failed
+  widget error, export started, export complete with row count, export cancelled, export failed
+- Export **progress** is announced at 25/50/75% only when progress is determinate. With an
+  indeterminate export there is no percentage to announce, so the announcement is a periodic row
+  count instead, at most once every 5 seconds — a live region driven by an unbounded row counter is
+  an announcement storm, not feedback
 
 ##### Structure and navigation (A11Y-2)
 
@@ -549,6 +722,14 @@ hears an unintelligible run-on. Per-widget live regions do not compose.
 - Focus indicators: a visible ring on every interactive element meeting 3:1 contrast against both
   adjacent colors. Never `outline: none` without an equivalent replacement, and the ring must be
   visible in dark mode, which `globals.css` already switches on via `prefers-color-scheme`
+- **Form errors are programmatically associated with their field**, per the requirements' "Form
+  labels and error message associations". A `<label for>`/`id` pair is necessary but not sufficient:
+  an invalid control also carries `aria-invalid="true"` and an `aria-describedby` pointing at the id
+  of its message element, so a screen reader user hears *why* the field is rejected when they land
+  on it rather than only when the message first appears. This applies to every input in
+  `ExportDialog` — date range, health-score bounds, tier selection. The message element must exist
+  in the DOM only when there is an error, and `aria-describedby` must be removed with it, because a
+  dangling reference is announced as nothing at all
 
 ##### Keyboard shortcuts (A11Y-3)
 
@@ -608,11 +789,28 @@ hears an unintelligible run-on. Per-widget live regions do not compose.
   `AbortController`, `MutationObserver`, and `createObjectURL` created by orchestrator-owned code
   has a matching teardown in the same `useEffect` cleanup. `StrictMode` double-invocation in
   development is the cheapest way to catch a missing one
+- **Core Web Vitals are tracked in-app, because Next ships the hook.** `useReportWebVitals` is part
+  of `next/web-vitals` — no new runtime dependency — so a `WebVitalsReporter` client component
+  mounted in `layout.tsx` collects LCP, CLS, INP, FCP, and TTFB and posts them to `/api/errors`'s
+  sibling shape (same redaction, same rate limit, `category: 'internal'`, `severity: 'warning'`).
+  This is field data from real sessions, which a Lighthouse run cannot give you. An earlier draft
+  deferred CWV tracking wholesale; only *alerting and enforcement* actually need infrastructure this
+  repo lacks, and conflating the two gave away something free
+- Reporting is sampled (10% of sessions, a named constant) and honors the same session caps as
+  `reportError`, so telemetry cannot become the dashboard's dominant network traffic
 - Budgets from the requirements — FCP < 1.5s, LCP < 2.5s, CLS < 0.1, TTI < 3.5s, load < 3s — are
   carried forward as targets. See [Deferred With Rationale](#deferred-with-rationale) for why they
   cannot be *enforced* in this repository, and the Manual acceptance criteria for what is measured
+- **Bundle size is measured, not assumed.** "Tree shaking and dead code elimination" and "Bundle
+  analysis and size optimization" are explicit requirements and cost one devDependency:
+  `@next/bundle-analyzer`, wired to an `npm run analyze` script gated on an env var so it never
+  affects a normal build. Recorded budgets: initial JS for `/` under 200 KB gzipped, and no single
+  widget chunk over 50 KB gzipped. These are starting values, adjustable without renegotiating the
+  spec — the point is that a regression becomes visible instead of arriving unnoticed. Tree shaking
+  additionally requires that the barrel-free import style above is kept: importing a whole module
+  namespace to use one function defeats it
 
-#### S1–S5 — Security
+#### S1–S6 — Security
 
 ##### S1 — Security headers: `next.config.ts`
 
@@ -652,6 +850,21 @@ inert, not harmful.
   `NODE_ENV` so it can never reach production
 - `blob:` on `img-src` is present for object-URL previews; it is **not** needed for downloads and
   must not be added to `script-src`, where `blob:` would reopen script injection
+- Under CSP Level 3, `'strict-dynamic'` causes host- and scheme-source expressions in `script-src`
+  to be **ignored** — so the `'self'` there is inert in modern browsers and is retained only as a
+  fallback for CSP2-era engines. Do not "fix" it by removing `'strict-dynamic'`, and do not add
+  origins to `script-src` expecting them to take effect
+- **Scope the middleware with a `matcher`.** Left unmatched it runs on `/_next/static/*` too,
+  minting a nonce per asset request for no benefit. Exclude static assets and prefetches
+- **The nonce costs static generation, and this is the trade the spec is making.** Reading it via
+  `headers()` marks the consuming route dynamic, so the dashboard is server-rendered per request
+  instead of served as static HTML. That works against the FCP/LCP/TTI budgets in P1 and against the
+  "CDN configuration" deferral, which assumes cacheable static output. The trade is deliberate — a
+  nonce is the only way to get a strict CSP on an App Router app, and XSS protection outranks a
+  cache hit on an internal dashboard — but it must be stated, because the symptom otherwise appears
+  much later as an unexplained Lighthouse regression. If static output later matters more, the
+  alternative is hash-based CSP for a fixed set of inline scripts, which Next does not currently make
+  practical
 - Ship a `Content-Security-Policy-Report-Only` variant first if you are unsure; a wrong CSP is a
   white screen, and the failure mode is total
 
@@ -683,19 +896,65 @@ inert, not harmful.
   `dangerouslySetInnerHTML` anywhere in orchestrator-owned code
 - CSV output is escaped per F8. **JSX escaping does not cover file output** — this is the one place
   where the repo's existing security posture has a real gap, and it is created by adding export
+- **API responses are validated, not trusted.** The requirements ask for validation of "all user
+  inputs **and API responses**", and external data ("Data validation and sanitization from external
+  sources"). Every widget parses its own response through a type guard before rendering, treating a
+  shape mismatch as a `ValidationError` shown in its error state — not as a render-time crash. Today
+  every response comes from this app's own mock-backed routes, so this is cheap insurance; it becomes
+  load-bearing the moment a real upstream is introduced, which is exactly when nobody remembers to
+  add it. `src/lib/validateResponse.ts` provides the shared helper so each widget is not inventing
+  its own
+- **Client-side rate limiting covers export, not just fetches.** The requirements name "Client-side
+  rate limiting and request throttling", and export is the expensive client operation: it is
+  unauthenticated, user-triggered, and can consume the main thread for seconds. Only one export may
+  run at a time (enforced by the dialog's own state, not by disabling a button in one branch), and a
+  completed or cancelled export imposes a 2-second cooldown before another can start. This prevents
+  a user holding Enter from queueing overlapping generators that race for the same download
 
 ##### S5 — Health check: `GET /api/health`
 
-- Returns `200` with `{ "status": "ok", "timestamp": "<ISO>", "version": "<package version>" }`
-- **No dependency detail, no versions of internal libraries, no hostnames, no environment variable
-  names, no uptime of internal services.** An unauthenticated health endpoint that enumerates
-  internals is a reconnaissance gift. Detailed dependency health belongs behind auth, which this
-  repo does not have
+- Returns `200` with exactly `{ "status": "ok", "timestamp": "<ISO>" }`
+- **No version, no dependency detail, no hostnames, no environment variable names, no uptime of
+  internal services.** An unauthenticated health endpoint that enumerates internals is a
+  reconnaissance gift, and an application version is the most useful field on it for anyone matching
+  a deployment against a CVE list. An earlier draft of this spec returned `version` while forbidding
+  version disclosure in the same paragraph; the field is gone. A monitor that needs to know which
+  build is live should read it from the deployment platform, which already knows and already
+  authenticates. Detailed dependency health belongs behind auth, which this repo does not have
 - `Cache-Control: no-store`, so a load balancer never reads a cached "ok"
 - Liveness only. It reports that the Next process can serve a request. It does not check the mock
   data modules, because they are static imports — if they were broken, the process would not have
   started. A readiness probe that always returns the same value as liveness is noise; add one when
   a real external dependency exists
+
+##### S6 — Environment configuration and production logging
+
+The requirements ask for "Environment-specific configuration management", "Secure environment
+variable management", and "Production logging configuration with appropriate log levels". The repo
+currently has no `.env` file and no config module, and `isDevelopment` (F6) is not configuration
+management.
+
+- **One validated config module, `src/lib/config.ts`.** It reads every environment variable the app
+  uses exactly once, validates and coerces each, and exports a frozen typed object. A missing or
+  malformed **required** variable throws at module load, so a misconfigured deployment fails at
+  startup rather than at the first request that happens to need the value
+- Variables read today: `NODE_ENV`, `LOG_LEVEL` (default `info`), `ERROR_REPORT_SAMPLE_RATE`
+  (default `1`), `WEB_VITALS_SAMPLE_RATE` (default `0.1`). Deliberately few — an env var with no
+  current reader is an invitation to drift
+- **No secrets exist yet, and the rule that keeps it that way:** any variable holding a credential
+  must be server-only and must never be prefixed `NEXT_PUBLIC_`, which inlines a value into the
+  client bundle where it is world-readable. `config.ts` splits its exports into a `server` object
+  and a `client` object, and the `server` object is never imported from a `'use client'` module — a
+  boundary a reviewer can check mechanically. Document `.env.example` with names and dummy values;
+  never commit a real `.env`
+- **Log levels, `src/lib/logger.ts`.** A minimal `error | warn | info | debug` logger over
+  `console`, filtering against `config.LOG_LEVEL`. Production defaults to `info`, so `debug` calls
+  cost nothing and can be left in the source. Every server-side log line is single-line JSON (as F7
+  already requires) so a log collector can parse it, and the logger applies the **same redaction
+  allowlist as F7** — a `logger.info` that interpolates a customer object leaks exactly what the
+  error path was careful not to
+- No log call anywhere may include a customer name, email, company, or domain. This is the single
+  rule that "Sensitive information protection in error messages and logs" reduces to
 
 ### Integration Requirements
 
@@ -729,7 +988,9 @@ inert, not harmful.
   cross-directory imports
 - **No new runtime dependencies.** Virtualization, focus trapping, and CSV generation are all
   implemented directly: `<dialog>` covers focus trapping natively, and the CSV writer is under 60
-  lines. Vitest and `axe-core` are added as devDependencies only (see Testing)
+  lines. Core Web Vitals use `next/web-vitals`, which ships with Next. devDependencies only:
+  `vitest`, `jsdom`, `@testing-library/react`, `axe-core`, `@next/bundle-analyzer`, and Playwright
+  if the browser-based accessibility checks in Testing are automated
 
 ### File Structure
 
@@ -751,6 +1012,7 @@ src/components/Announcer.tsx
 src/components/SkipLink.tsx
 src/components/ExportDialog.tsx
 src/components/KeyboardShortcutsDialog.tsx
+src/components/WebVitalsReporter.tsx         # useReportWebVitals; mounted in layout.tsx
 src/lib/dashboard/DashboardContext.tsx
 src/lib/dashboard/widgetRegistry.ts
 src/lib/dashboard/useKeyboardShortcuts.ts
@@ -762,10 +1024,13 @@ src/lib/export/exportRegistry.ts
 src/lib/export/csv.ts
 src/lib/export/json.ts
 src/lib/export/filename.ts
-src/lib/env.ts                                  # single isDevelopment export
+src/lib/config.ts                               # validated env vars; isDevelopment; server/client split
+src/lib/logger.ts                               # log levels + F7 redaction
+src/lib/validateResponse.ts                     # shared API-response type guards
 src/lib/rateLimit.ts
 src/data/customer-fixtures.ts                   # deterministic generateCustomers(count)
 src/types/dashboard.ts                          # shared WidgetProps / descriptor types
+.env.example                                    # names + dummy values; never a real .env
 ```
 
 ### Code Quality
@@ -792,6 +1057,17 @@ a second one. Also add `axe-core` (with `jsdom` and a testing-library renderer) 
 for the automated accessibility assertions
 `requirements/production-ready-dashboard.md` explicitly requires.
 
+**What axe-core under jsdom cannot do.** The requirements ask for both "Automated accessibility
+testing with axe-core integration" and "Color contrast validation". jsdom has no layout and no
+paint, so axe's `color-contrast` rule cannot evaluate — it returns **incomplete**, not pass, and a
+naive assertion on "no violations" will report success while checking nothing. Therefore:
+
+- The jsdom axe run asserts zero violations **and** explicitly disables `color-contrast` so its
+  absence is a stated decision rather than a silent hole
+- Contrast and forced-colors verification stay in the Manual criteria, where a real browser exists.
+  Automating them requires Playwright with `@axe-core/playwright`; that is a worthwhile follow-up
+  and is not assumed here
+
 Required unit tests — these cover the logic where a plausible-looking wrong implementation passes
 casual review:
 
@@ -812,14 +1088,47 @@ casual review:
   clock, eviction at the key cap
 - `src/data/customer-fixtures.test.ts` — `generateCustomers(200)` is deterministic across calls and
   processes, ids are unique, and every record satisfies the `Customer` type
+- `src/lib/config.test.ts` — a missing required variable throws at load; defaults apply when a
+  variable is absent; a malformed numeric sample rate is rejected rather than coerced to `NaN`
+- `src/lib/logger.test.ts` — `LOG_LEVEL=warn` suppresses `info` and `debug`; a customer object
+  passed to any level is redacted identically to `reportError`
+
+Required error-scenario tests — `requirements/production-ready-dashboard.md` names these explicitly
+under "Error Scenario Testing", and each is a path that silently regresses:
+
+- **Network failure and timeout.** With `fetch` stubbed to reject, to resolve non-2xx, and to hang
+  past the widget timeout, a widget shows its error state with a retry control and reports exactly
+  one error — and the dashboard, its other widgets, and export all keep working. This is the async
+  channel from Data flow §3, the one no error boundary catches
+- **Invalid data.** A provider yielding a row missing a declared column, a `Customer` with a
+  non-finite `healthScore`, and an API response failing its type guard each degrade to a message
+  rather than a crash
+- **Chunk-load failure.** A `load` whose import rejects renders `WidgetUnavailableTile`; a `load`
+  that rejects for any other reason renders the tile *and* reports (F1)
+- **Lazy retry.** After a chunk-load failure, "Try again" constructs a fresh `lazy()` and can
+  succeed when the import is stubbed to resolve on the second attempt — the regression test for
+  trap 2 in F1, which no other test would catch
+- **Export edge cases at size.** A 50,001-row export on the buffered path is refused with an
+  explanation rather than attempted; a zero-row export produces a valid file with headers and no
+  data rows
 
 Required component tests:
 
 - `WidgetErrorBoundary.test.tsx` — a throwing child renders the fallback while a sibling stays
-  mounted; retry remounts (a child counting its own mounts proves it); the retry control disappears
-  after `maxRetries`; a changed customer id resets the attempt counter
+  mounted **and retains its internal state** (a sibling holding a counter proves isolation in a way
+  "is still in the document" does not); retry remounts (a child counting its own mounts proves it);
+  the retry control disappears after `maxRetries`; a changed customer id resets the attempt counter;
+  the fallback renders no heading and no `role="alert"`
 - `DashboardGrid.test.tsx` — a rejecting `load` renders `WidgetUnavailableTile` and calls no
-  reporter for a module-not-found reason; skeleton height matches the descriptor
+  reporter for a module-not-found reason; skeleton height matches the descriptor; a
+  `requiresCustomer` widget shows the selection prompt and fetches no chunk while
+  `selectedCustomer` is `null`
+- `DashboardGrid.stability.test.tsx` — **re-rendering the grid does not remount its widgets.** A
+  widget incrementing a mount counter must report exactly one mount across several parent re-renders
+  and a customer change. This is the regression test for trap 3 in F1, the failure that would
+  otherwise present only as mysteriously vanishing widget state
+- `exportRegistry.test.ts` — a provider is withdrawn when its widget unmounts, and the dialog then
+  offers the remaining datasets rather than erroring (F5c)
 - `Announcer.test.tsx` — two rapid announcements are delivered sequentially, not overwritten; an
   identical consecutive message is dropped
 - `DashboardOrchestrator.a11y.test.tsx` — axe reports no violations in the default state and with a
@@ -842,13 +1151,22 @@ require a browser, a screen reader, or a Lighthouse run.
 
 ### Automated — error handling
 - [ ] A widget that throws during render shows the widget fallback while every sibling widget
-      remains mounted and interactive
+      remains mounted, interactive, **and in possession of its own state**
 - [ ] "Try again" remounts the widget subtree rather than re-rendering the same instance
+- [ ] **After a failed chunk load, "Try again" can actually succeed** — the retry constructs a fresh
+      `lazy()` rather than re-throwing the cached rejection
+- [ ] **Re-rendering the grid does not remount widgets** — a mount counter reports one mount across
+      repeated parent re-renders and a customer change
 - [ ] The retry control is gone after `maxRetries` consecutive failures, replaced by a permanent
       message; no infinite retry loop and no unbounded error reports
 - [ ] Changing the selected customer resets a widget's retry counter to zero
 - [ ] A registry entry whose `load` rejects renders `WidgetUnavailableTile` and reports nothing for
-      a module-not-found reason
+      a module-not-found reason; a chunk that exists but throws on evaluation renders the tile and
+      **does** report
+- [ ] A network failure, a non-2xx response, and a hung request each surface a retryable widget
+      error state without involving an error boundary, and leave siblings and export working
+- [ ] With any single widget failed, customer selection and export of the remaining datasets both
+      still work (F5c)
 - [ ] `AppError` subclasses are categorized by their `category` field, and categorization still
       works after a production build (no reliance on `constructor.name`)
 - [ ] `reportError` never throws and never rejects, including when the transport throws
@@ -858,13 +1176,22 @@ require a browser, a screen reader, or a Lighthouse run.
 ### Automated — export
 - [ ] A customer named `=HYPERLINK("http://evil","x")` exports as a text cell prefixed with `'`,
       not as a formula
+- [ ] A **numeric** cell of `-12` exports as `-12`, not `'-12` — the injection guard applies to
+      string values only and does not corrupt numeric columns
 - [ ] Fields containing quotes, commas, and newlines round-trip through a spec-compliant CSV parser
 - [ ] The CSV begins with a UTF-8 BOM and uses `\r\n` line terminators
 - [ ] Only columns declared in `provider.columns` appear, in that order, even when a provider yields
       extra keys
+- [ ] **JSON output is restricted to the same `provider.columns` allowlist** — a provider yielding
+      an undeclared `email` key leaks it in neither format
 - [ ] JSON exports include `metadata.dataSource === "mock"`
 - [ ] Cancelling mid-export stops row consumption, writes no file, and leaves no partial download
-- [ ] A 5,000-row export completes with the correct row count and never buffers all rows at once
+- [ ] A 5,000-row export completes with the correct row count, consuming rows in batches, with no
+      batch retained after it is encoded
+- [ ] On the `showSaveFilePicker` path, peak memory does not grow with row count (verified by
+      exporting 5,000 and 50,000 rows and comparing heap snapshots); on the buffered path a
+      50,001-row export is refused with an explanation instead of attempted
+- [ ] Only one export runs at a time, and a second cannot start within the 2-second cooldown
 - [ ] Filenames contain no colon; `_filtered` appears exactly when a filter narrows the set
 - [ ] `URL.revokeObjectURL` is called for every `createObjectURL`, including on the error path
 
@@ -872,23 +1199,36 @@ require a browser, a screen reader, or a Lighthouse run.
 - [ ] `POST /api/errors` returns `204` with an empty body on success
 - [ ] A malformed report returns `400` with a `{ error }` body containing no stack trace and no
       internal path
-- [ ] A non-POST method returns `405`; a body over 16 KB returns `413`
+- [ ] A non-POST method returns `405`; an unsupported content type returns `415`
+- [ ] A body over 16 KB returns `413` **both** when `Content-Length` declares it and when the header
+      is absent or understates it — the byte counter, not just the header, enforces the cap
+- [ ] A `sendBeacon`-shaped request (typed `Blob`, `application/json`) is accepted, and so is a
+      `text/plain` beacon
 - [ ] The 21st request in a minute returns `429` with `Retry-After`
-- [ ] `GET /api/health` returns `200` with `status`, `timestamp`, and `version` only — no dependency,
-      host, or environment detail
+- [ ] `GET /api/health` returns `200` with `status` and `timestamp` only — **no `version`**, no
+      dependency, host, or environment detail
 - [ ] Both routes send `Cache-Control: no-store`
-- [ ] Redaction strips `name`, `company`, `email`, and `domains`, and strips an email-shaped string
-      nested in `detail`
+- [ ] Redaction keeps `error.name` while stripping `customer.name`, `company`, `email`, and
+      `domains`, and strips an email-shaped string nested in `detail` and in `error.message`
+- [ ] `config.ts` throws at load on a missing required variable and applies documented defaults
+      otherwise; no `NEXT_PUBLIC_`-prefixed variable holds a credential
+- [ ] `logger` suppresses levels below `LOG_LEVEL` and redacts customer objects at every level
 - [ ] Invalid export filters (unparseable date, `min > max`, out-of-range score, unknown tier) are
       rejected client-side with an inline message and no request
 
 ### Automated — accessibility
-- [ ] axe-core reports no violations in the default state and with a customer selected
+- [ ] axe-core reports no violations in the default state and with a customer selected, with
+      `color-contrast` explicitly disabled (it cannot run under jsdom — see Testing) rather than
+      silently returning incomplete
 - [ ] Exactly one `h1`, exactly one `main`, and no positive `tabIndex` in the rendered dashboard
-- [ ] Every widget `<section>` has an accessible name via `aria-labelledby`
+- [ ] Every widget `<section>` has an accessible name via `aria-labelledby` pointing at its `<h2>`
+- [ ] A widget heading survives its widget's failure, and no duplicate `<h2>` with the same text
+      appears in the error state
 - [ ] Two rapid announcements are both delivered; an identical consecutive one is dropped
-- [ ] Exactly one `aria-live="polite"` and one `aria-live="assertive"` region exist for the whole
-      dashboard
+- [ ] **Counting implicit regions** (`role="alert"`, `role="status"`) as well as explicit ones, the
+      mounted dashboard has exactly one polite and one assertive live region
+- [ ] Invalid export inputs carry `aria-invalid="true"` and an `aria-describedby` resolving to the
+      visible message; both are removed when the field becomes valid
 
 ### Manual — browser verification
 - [ ] `Tab` from page load lands on the skip link first; activating it moves focus into `<main>`
@@ -910,9 +1250,16 @@ require a browser, a screen reader, or a Lighthouse run.
 - [ ] Response headers include all of S1's headers plus `Content-Security-Policy`
 - [ ] `next build` output shows widget code in separate chunks, and the export writers absent from
       the initial JS
+- [ ] `npm run analyze` reports initial JS for `/` under 200 KB gzipped and no widget chunk over
+      50 KB gzipped
 - [ ] Lighthouse on a production build meets FCP < 1.5s, LCP < 2.5s, CLS < 0.1, TTI < 3.5s on a
       broadband profile — recorded as a measurement, not enforced by any check in the repo
-- [ ] Interactions stay at 60fps during a 5,000-row export (verified in the Performance panel)
+- [ ] `useReportWebVitals` delivers LCP/CLS/INP/FCP/TTFB for a sampled session, redacted and rate
+      limited like error reports
+- [ ] During a 5,000-row export the UI stays responsive and no single main-thread task exceeds
+      50ms (measured in the Performance panel). Sustained 60fps is **not** claimed for the buffered
+      path — encoding runs on the main thread between yields, so the honest guarantee is bounded
+      task length, and a Web Worker is the upgrade path if that proves insufficient
 - [ ] No detached-node or listener growth after 20 customer-selection cycles (verified with heap
       snapshots)
 - [ ] Development fallbacks show stack and component stack; a production build shows neither, and
@@ -920,9 +1267,17 @@ require a browser, a screen reader, or a Lighthouse run.
 
 ### Manual — screen reader verification
 - [ ] Customer selection is announced once, not once per widget
-- [ ] Export start, progress, completion, and cancellation are each announced
-- [ ] A widget error is announced via its `role="alert"` fallback
-- [ ] Verified against at least two of NVDA, JAWS, and VoiceOver
+- [ ] Export start, completion, and cancellation are each announced; progress is announced as
+      percentages when determinate and as a throttled row count when not
+- [ ] A widget error is announced through the shared assertive region, and the dashboard-level
+      fallback announces once — not twice from focus landing on its own `role="alert"`
+- [ ] Verified against at least two of NVDA, JAWS, and VoiceOver on desktop
+- [ ] **Mobile accessibility**, which the requirements call out separately: verified with TalkBack
+      on Android and VoiceOver on iOS at 320–430px widths. Specifically that the export `<dialog>`
+      is reachable and dismissable with touch-based screen reader gestures, that swipe navigation
+      reaches every widget section, and that the skip link is operable — a native `<dialog>` behaves
+      differently under mobile screen readers than under desktop ones, so desktop passes do not
+      transfer
 
 ## Deferred With Rationale
 
@@ -933,12 +1288,15 @@ decision the reader can overturn.
 | Requirement | Why deferred | Precondition |
 |---|---|---|
 | Authentication, authorization, session management, secure cookies | The repo has no auth system, no user model, and no server-side session. `mockCustomers` is a static import with no access control | An identity provider and a session layer |
-| CSRF protection | No cookie-authenticated state-changing endpoint exists. `POST /api/errors` is unauthenticated and has no persistent side effect, so a CSRF token would be theater | Cookie-based auth |
-| "Export audit logging and user permission validation" | An audit log with no authenticated identity records only an in-memory `sessionId` — useful for debugging, worthless for the compliance purpose the requirement names. Implemented at that honest level, and labelled as such | Auth |
+| CSRF protection | No cookie-authenticated endpoint exists, so there is no ambient credential for a forged request to ride. `POST /api/errors` does have a side effect — it writes a log line — but a token cannot protect it: the endpoint is deliberately open, and a cross-site forgery is indistinguishable from a genuine report. The mitigation for log spam is the rate limit in S3, and its per-instance weakness is stated there | Cookie-based auth |
+| "Export audit logging and user permission validation" | **Not implemented.** Both halves need an authenticated identity: a permission check has no subject to authorize, and an audit record keyed only to an in-memory `sessionId` cannot answer "who exported this", which is the sole question an audit log exists to answer. Writing one anyway would produce a compliance artifact that looks authoritative and is not — worse than its absence. An earlier draft of this spec claimed it was "implemented at an honest level"; there is no export route for it to live in, so that was a promise with nowhere to land | Auth, plus a server-side export route to log from |
 | Service worker and offline capability | A SW that caches `/api/*` directly contradicts the `Cache-Control: no-store` that `specs/market-intelligence-spec.md` requires, and would serve stale market data while claiming freshness. For an all-mock dataset the offline benefit is near zero against a real risk of a poisoned cache with no kill switch | A real data layer, a cache-invalidation strategy, and an unregister path |
 | CDN configuration, connection pooling, backup and recovery | Deployment-platform and database concerns; there is no database and no chosen host | A deployment target |
 | External error-tracking integration (Sentry et al.) | Would add a runtime dependency and an outbound trust boundary. `POST /api/errors` plus structured server logs is the vendor-neutral seam a vendor would later plug into | A chosen vendor and a DSN in secret management |
-| Core Web Vitals **enforcement**, "custom monitoring dashboard", user-interaction analytics | Targets are stated and measurable manually, but there is no CI, no RUM endpoint, and no analytics backend, so no check in this repo can fail on a regression. Analytics would also raise consent questions the workshop does not address | CI with Lighthouse budgets; a metrics sink |
+| Core Web Vitals **alerting and enforcement**, "custom monitoring dashboard", user-interaction analytics | Collection is *not* deferred — P1 now tracks vitals via `useReportWebVitals`, which ships with Next. What needs infrastructure is the other end: there is no CI to fail a budget, no time-series store to trend against, and no analytics backend. Interaction analytics would also raise consent questions the workshop does not address | CI with Lighthouse budgets; a metrics sink |
+| Health score **history**, alert history, market **trend reports** | The export requirements name historical reports and trends, but no component in this repo persists anything: `mockCustomers` is a static array, market data is regenerated deterministically per call, and there is no store to accumulate a time series in. The export system is built provider-shaped precisely so a history provider can be added without touching `ExportDialog` — the missing piece is data that exists over time, not export plumbing | A persistence layer that retains prior values |
+| Alt text for informational **charts** | The dashboard renders no charts today. When one lands, the requirement is a text alternative conveying the *trend*, not a description of the picture, plus a data table equivalent — noted here so it is not rediscovered late | A chart |
+| Secure cookie configuration | The app sets no cookies. `sessionId` is deliberately in-memory (F7) so nothing needs a consent banner or a `Secure`/`HttpOnly`/`SameSite` policy. HTTPS enforcement itself *is* delivered, via HSTS in S1 | Any cookie |
 | Image optimization and asset compression | The dashboard renders no images beyond `favicon.ico`, and Next already compresses responses by default. Nothing to optimize | Images |
 | Performance alerting, error-rate thresholds, dependency health monitoring | Alerting lives in the monitoring system, not the app. `/api/health` is the integration point that makes it possible | An uptime/APM service |
 | Source maps in production | A one-line `next.config.ts` toggle, but it exposes source to anyone with devtools. The right call depends on whether the deployment is public, which is unknown | A decision on deployment audience |
@@ -957,3 +1315,10 @@ decision the reader can overturn.
   storage-consent implications
 - Theming beyond the `prefers-color-scheme` support already in `globals.css`
 - Internationalization and localization
+- Retry, backoff, and fallback behavior for a widget's own external calls. The requirements' "Robust
+  handling of external API failures and timeouts" is satisfied per-widget — `MarketIntelligenceWidget`
+  already specifies its own 8-second timeout, abort-on-supersession, and retry control. The
+  orchestrator's contribution is the shared `reportError` sink, the `ValidationError` type, and the
+  guarantee that a widget stuck in its error state costs nothing to its siblings (F5c). Centralizing
+  fetch policy here would mean the orchestrator knowing each widget's endpoints, which the registry
+  design exists to avoid
